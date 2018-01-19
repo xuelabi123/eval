@@ -1,0 +1,259 @@
+# -*- coding: utf-8 -*-
+
+from frankdb import Frankdb
+import math
+import time
+import re
+import jieba.analyse
+import codecs
+import collections
+from eval_email import EvalEmail
+
+class Bayes(object):
+
+    def __init__(self):
+        self.frank = Frankdb()
+        self.industrys = [1,4,35,46,57,69,83,104,119,133,142,152,180,182,220,243,545]
+    
+    #提取关键词    
+    def news_keywords(self,content):
+        
+        content1 = re.sub('<[^>]*>','', content)
+        
+        tags = jieba.analyse.extract_tags(content1,15)
+        
+        return tags
+    
+    
+    def labels2index(self,id):
+        for i in xrange(len(self.industrys)):
+            if int(id)==self.industrys[i]:
+                return i
+        return None
+    
+    def doc_dict(self):
+        return [0]*len(self.industrys)
+    
+    def get_train_txt(self,inp_file):
+        print '开始生成训练集...'
+        sql = '''
+        select industry_id, count(id) total from zt_news where industry_id>0 group by industry_id order by total desc limit 17
+        '''
+        industrys = self.frank.getAll(sql)
+        for industry in industrys:
+            sql='''
+            select industry_id, article_content from zt_news where industry_id=%s order by id desc limit 500
+            '''
+            news_list = self.frank.getAll(sql,(industry['industry_id'],))
+            self.wirte_words(inp_file,news_list)
+            
+    def get_test_txt(self,inp_file,limit=100):
+        print '开始生成测试集...'
+        sql='''
+        select industry_id, article_content from zt_news where industry_id>0 order by id desc limit %s
+        '''
+        news_list = self.frank.getAll(sql,(limit,))
+        self.wirte_words(inp_file,news_list)
+        
+    def wirte_words(self,file_txt,news_list):
+        print '正在提取关键词并写入文档...'
+        end_time = time.time()
+        f = codecs.open(file_txt,'a','utf-8')
+        for news in news_list:
+            f.write(str(news['industry_id'])+' ')
+            tags = self.news_keywords(news['article_content'])
+            if len(tags) == 0:
+                continue
+            for tag in tags:
+                f.write(tag+' ')
+            f.write('\n')
+        end_time1 = time.time()
+        time2 = end_time1-end_time
+        print '文档写入完成,花费时间:%s' % time2    
+        f.close()
+        
+    def feature_words(self, train_file, feature_file):
+        
+        print '正在扫描并统计词表...'
+        docCount = [0]*len(self.industrys)
+        dWords = set()
+        for line in open(train_file):
+            industry,text = line.strip().split(' ',1)
+            index = self.labels2index(industry)
+            if index is None:
+                continue
+            words = text.split(' ')
+            for word in words:
+                docCount[index]+=1
+                dWords.add(word)
+                
+        f = open(feature_file,'w')
+        f.write(str(docCount)+'\n')
+        for dword in dWords:
+            f.write(dword+'\n')
+        
+        print '词表统计完成'
+        f.close()
+    
+    def load_feature(self,feature_file):
+        f = open(feature_file)
+        docCounts = eval(f.readline())
+        features = set()
+        for line in f:
+            features.add(line.strip())
+        f.close()
+        return docCounts,features
+        
+    def train_bayes(self, train_file,feature_file,model_file):
+        '''
+        构建模型，其实就是统计每个分类的词量
+        '''
+        print '开始训练...'
+        
+        wordCount = collections.defaultdict(self.doc_dict)
+        tCount = [0]*len(self.industrys)
+        docCounts,features = self.load_feature(feature_file)
+        
+        for line in open(train_file):
+            industry,text = line.strip().split(' ',1)
+            index = self.labels2index(industry)
+            if index is None:
+                continue
+            words = text.split(' ')
+            for word in words:
+                if word in features:
+                    tCount[index]+=1
+                    wordCount[word][index]+=1
+                    
+        print '训练完毕，写入模型...'
+        model = open(model_file,'w')
+        for k,v in wordCount.items():
+            scores = [(v[i]+1) * 1.0 / (tCount[i]+len(wordCount)) for i in xrange(len(v))]
+            model.write(k+'\t'+str(scores)+'\n')
+        model.close()
+        
+    def load_model(self, model_file):
+        '''
+        加载训练好的模型
+        '''
+        print '正在加载模型...'
+        model = open(model_file)
+        
+        scores = {}
+        for line in model:
+            word,counts = line.strip().rsplit('\t',1)
+            scores[word] = eval(counts)
+        model.close()
+        return scores
+    
+    def predict(self,feature_file,model_file,test_file):
+        
+        docCounts,features = self.load_feature(feature_file)
+        docScores = [math.log(count * 1.0 /sum(docCounts)) for count in docCounts]
+        scores = self.load_model(model_file)
+        rCount=0
+        docCount=0
+        print '开始测试...'
+        f=open(test_file)
+        for line in f:
+            industry,text = line.strip().split(' ',1)
+            index = self.labels2index(industry)
+            if index is None:
+                continue
+            words = text.split(' ')
+            preValues = list(docScores)
+            for word in words:
+                if word in features:                
+                    for i in xrange(len(preValues)):
+                        preValues[i]+=math.log(scores[word][i])
+            m = max(preValues)
+            pIndex = preValues.index(m)
+            if pIndex == index:
+                rCount += 1
+            #print lable,lables[pIndex],text
+            docCount += 1
+        print '测试结束.'
+        percent = round(rCount*1.0/docCount*100,4)
+        eval_email = EvalEmail()
+        content = '<h2>Hi,Boss,分类器最新预测结果如下</h2><p>总共测试文本: %d, 预测正确的文本: %d, 预测准确度: %s</p>' %(docCount,rCount,str(percent)+'%')
+        subject = '分类器最新预测结果'
+        mail_to = '1070993165@qq.com'
+        eval_email.send_email(mail_to,subject,content)
+#        print "测试结果> 总共测试文本量: %d, 预测正确的文本量: %d, 预测准确度: %s" %(docCount,rCount,str(percent)+'%')
+            
+    def forecast(self,feature_file,model_file):
+        cur_time = time.time()
+        time1 = cur_time-cur_time%86400
+        sql='''
+        select id, article_title, article_content from zt_news where industry_id=0 and create_time>%s
+        '''
+        news_list = self.frank.getAll(sql,(time1,))
+        if news_list is None:
+            print '暂时没有可分类的文章'
+        else:
+            model = self.load_model(model_file)
+            docCounts,features = self.load_feature(feature_file)
+            finace_words = self.load_finacewords()
+            news_industry = list()
+            print '正在分类...'
+            total=0
+            for news in news_list:
+                tags = self.news_keywords(news['article_content'])
+                title_words = jieba.cut(news['article_title'],cut_all=True)
+                type_id=0
+                recommend=0
+                for word in title_words:
+                    if word in finace_words:
+                        type_id=6
+                        recommend=1
+                        break
+                industry_id = self.news_cate(tags,docCounts,features,model)
+                news_industry.append({"news_id":news['id'],"industry_id":industry_id,"type_id":type_id,"recommend":recommend})
+                total+=1
+            for news1 in news_industry:
+                sql='''
+                update zt_news set industry_id=%s,type_id=%s,is_promote=%s where id=%s
+                '''
+                self.frank.update(sql,(news1['industry_id'],news1['type_id'],news1['recommend'],news1['news_id']))
+            self.frank.commit()
+            print '分类结束,共完成 %s 篇资讯分类' % total
+                
+    def news_cate(self,words,docCounts,features,model):
+        #print docCounts
+        docScores = [math.log(count * 1.0 /sum(docCounts)) for count in docCounts]
+        preValues = list(docScores)
+        for word in words:
+            if word in features:                
+                for i in xrange(len(preValues)):
+                    preValues[i]+=math.log(model[word][i])
+        m = max(preValues)
+        pIndex = preValues.index(m)
+        #print lable,lables[pIndex],text
+        return self.industrys[pIndex]
+    
+    
+    def set_project(self,project_file):
+        print '正在读取数据...'
+        sql='''
+        select id, project_name from zt_project
+        '''
+        projects = self.frank.getAll(sql)
+        f = codecs.open(project_file,'w','utf-8')
+        print '正在写入文档...'
+        for project in projects:
+            f.write(str(project['id'])+' '+project['project_name']+'\n')
+        
+        print '写入完毕!'
+        f.close()
+        
+    def loadProject(self):
+        
+        lines = open('text_file/project.txt')
+        projects=list()
+        for line in lines:
+            project = line.strip().split(' ')
+            projects.add()
+            
+    def load_finacewords(self):
+        
+        return [u'融资',u'融',u'获',u'获投', u'战略投资',u'天使轮',u'首发',u'天使','Pre-A',u'Pre-A轮',u'A轮',u'A+轮',u'B轮',u'C轮',u'D轮',u'E轮']
